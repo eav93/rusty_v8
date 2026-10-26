@@ -2412,6 +2412,85 @@ fn object_template_set_accessor() {
 }
 
 #[test]
+fn property_handler_should_throw_on_error() {
+  // What each write callback was told about its caller, in call order.
+  static SEEN: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+
+  let _setup_guard = setup::parallel_test();
+  let isolate = &mut v8::Isolate::new(Default::default());
+  v8::scope!(let scope, isolate);
+  let context = v8::Context::new(scope, Default::default());
+  let scope = &mut v8::ContextScope::new(scope, context);
+
+  let setter = |_: &mut v8::PinScope,
+                _: v8::Local<v8::Name>,
+                _: v8::Local<v8::Value>,
+                args: v8::PropertyCallbackArguments,
+                _: v8::ReturnValue<v8::Boolean>| {
+    SEEN.lock().unwrap().push(args.should_throw_on_error());
+    v8::Intercepted::kYes
+  };
+  let definer = |_: &mut v8::PinScope,
+                 _: v8::Local<v8::Name>,
+                 _: &v8::PropertyDescriptor,
+                 args: v8::PropertyCallbackArguments,
+                 _: v8::ReturnValue<v8::Boolean>| {
+    SEEN.lock().unwrap().push(args.should_throw_on_error());
+    v8::Intercepted::kYes
+  };
+  let deleter = |_: &mut v8::PinScope,
+                 _: v8::Local<v8::Name>,
+                 args: v8::PropertyCallbackArguments,
+                 _: v8::ReturnValue<v8::Boolean>| {
+    SEEN.lock().unwrap().push(args.should_throw_on_error());
+    v8::Intercepted::kYes
+  };
+  let getter = |_: &mut v8::PinScope,
+                _: v8::Local<v8::Name>,
+                args: v8::PropertyCallbackArguments,
+                _: v8::ReturnValue<v8::Value>| {
+    // Only a write is told the caller's strictness.
+    assert!(!args.should_throw_on_error());
+    v8::Intercepted::kNo
+  };
+
+  let templ = v8::ObjectTemplate::new(scope);
+  templ.set_named_property_handler(
+    v8::NamedPropertyHandlerConfiguration::new()
+      .getter(getter)
+      .setter(setter)
+      .definer(definer)
+      .deleter(deleter),
+  );
+  let obj = templ.new_instance(scope).unwrap();
+  let name = v8::String::new(scope, "obj").unwrap();
+  context.global(scope).set(scope, name.into(), obj.into());
+
+  for (source, expected) in [
+    ("obj.x = 1", false),
+    ("'use strict'; obj.x = 1", true),
+    ("(function () { 'use strict'; obj.x = 1; })()", true),
+    ("Reflect.set(obj, 'x', 1)", false),
+    ("'use strict'; Reflect.set(obj, 'x', 1)", false),
+    ("Object.assign(obj, { x: 1 })", true),
+    ("Object.defineProperty(obj, 'x', { value: 1 })", true),
+    ("Reflect.defineProperty(obj, 'x', { value: 1 })", false),
+    ("delete obj.x", false),
+    ("'use strict'; delete obj.x", true),
+    ("obj.x", false),
+  ] {
+    SEEN.lock().unwrap().clear();
+    eval(scope, source).unwrap();
+    let seen = SEEN.lock().unwrap().clone();
+    if source == "obj.x" {
+      assert!(seen.is_empty(), "{source}");
+    } else {
+      assert_eq!(seen, vec![expected], "{source}");
+    }
+  }
+}
+
+#[test]
 fn object_template_set_named_property_handler() {
   let _setup_guard = setup::parallel_test();
   let isolate = &mut v8::Isolate::new(Default::default());
