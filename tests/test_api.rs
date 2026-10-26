@@ -2415,6 +2415,9 @@ fn object_template_set_accessor() {
 fn property_handler_should_throw_on_error() {
   // What each write callback was told about its caller, in call order.
   static SEEN: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+  // How often the getter ran (it asserts what it is told itself).
+  static GETTER_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
   let _setup_guard = setup::parallel_test();
   let isolate = &mut v8::Isolate::new(Default::default());
@@ -2451,7 +2454,21 @@ fn property_handler_should_throw_on_error() {
                 _: v8::ReturnValue<v8::Value>| {
     // Only a write is told the caller's strictness.
     assert!(!args.should_throw_on_error());
+    GETTER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     v8::Intercepted::kNo
+  };
+  // An accessor setter (`PropertyCallbackInfo<void>`) is told too.
+  let accessor_getter =
+    |_: &mut v8::PinScope,
+     _: v8::Local<v8::Name>,
+     _: v8::PropertyCallbackArguments,
+     _: v8::ReturnValue<v8::Value>| {};
+  let accessor_setter = |_: &mut v8::PinScope,
+                         _: v8::Local<v8::Name>,
+                         _: v8::Local<v8::Value>,
+                         args: v8::PropertyCallbackArguments,
+                         _: v8::ReturnValue<()>| {
+    SEEN.lock().unwrap().push(args.should_throw_on_error());
   };
 
   let templ = v8::ObjectTemplate::new(scope);
@@ -2466,6 +2483,17 @@ fn property_handler_should_throw_on_error() {
   let name = v8::String::new(scope, "obj").unwrap();
   context.global(scope).set(scope, name.into(), obj.into());
 
+  let accessor_templ = v8::ObjectTemplate::new(scope);
+  let key = v8::String::new(scope, "x").unwrap();
+  accessor_templ.set_accessor_with_setter(
+    key.into(),
+    accessor_getter,
+    accessor_setter,
+  );
+  let acc = accessor_templ.new_instance(scope).unwrap();
+  let name = v8::String::new(scope, "acc").unwrap();
+  context.global(scope).set(scope, name.into(), acc.into());
+
   for (source, expected) in [
     ("obj.x = 1", false),
     ("'use strict'; obj.x = 1", true),
@@ -2477,17 +2505,22 @@ fn property_handler_should_throw_on_error() {
     ("Reflect.defineProperty(obj, 'x', { value: 1 })", false),
     ("delete obj.x", false),
     ("'use strict'; delete obj.x", true),
-    ("obj.x", false),
+    ("acc.x = 1", false),
+    ("'use strict'; acc.x = 1", true),
+    ("Reflect.set(acc, 'x', 1)", false),
   ] {
     SEEN.lock().unwrap().clear();
     eval(scope, source).unwrap();
     let seen = SEEN.lock().unwrap().clone();
-    if source == "obj.x" {
-      assert!(seen.is_empty(), "{source}");
-    } else {
-      assert_eq!(seen, vec![expected], "{source}");
-    }
+    assert_eq!(seen, vec![expected], "{source}");
   }
+
+  // The getter is asked too, and told `false` (its own assertion).
+  GETTER_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+  SEEN.lock().unwrap().clear();
+  eval(scope, "obj.x").unwrap();
+  assert_eq!(GETTER_CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
+  assert!(SEEN.lock().unwrap().is_empty());
 }
 
 #[test]
